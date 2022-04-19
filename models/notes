@@ -1,0 +1,57 @@
+
+demografia
+
+Features:
+
+x Transition probabilities -- v1
+x Informative priors on transitions -- v1
+x Fix impossible probabilities to zero -- v3
+x Sparse temporal sampling -- v2
+x Sampling frequency varies by site -- v4
+x Environmental effects -- v3
+- Density dependence
+- Fecundity
+- Seeds unobserved
+- Hierarchical random effects for sites/years/etc
+
+
+
+Fecundity, seedlings
+- For seedlings
+  - Assume that in == out. This allows us to get per capita s-->j from j appearances
+  - Assume no survival, allowing us to get mortality. Or vice versa.
+  - Together, this allows us to get p-->s, assuming known P. From that we can also get p-->x
+
+- For seed counts/outcomes, rather than providing it as data, we have to infer it within model
+  - Manually specify fecundity F (point or distribution)
+  - Can simulate/estimate adults per block per year, A
+  - From F & A, can get propagules per year P
+  
+- How to structure data:
+  - 1. Adults at t=0
+  - 2. Known fecundity
+  - 3. [projection matrix]
+  
+  
+  
+Data:
+- t0 counts for s, j, a
+- t5 counts for s, j, a
+- individual outcome counts for j, a
+- fecundity
+  
+  
+- partial N is the t5 outcomes for the individuals starting in a given class
+  - compute by doing 5 matrix projections on a vector such as [0,15,0,0], given A
+- this is an unobserved latent variable, multinomially distributed
+- across the K origin classes, these sum to observed N
+
+
+
+We need an estimate of N propagules at t0, to project N_t0 to N_t5.
+To get that, we use fecundity and also must calculate N adults at t = -1, 
+which we can get from N adults at t0, and from adult survival (aa).
+
+N_a_t0 = N_a_tn1 * aa
+N_a_tn1 = N_a_t0 / aa
+N_p_t0 = N_a_t0 / aa * F
