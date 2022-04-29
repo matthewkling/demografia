@@ -10,8 +10,8 @@ x Sparse temporal sampling -- v2
 x Sampling frequency varies by site -- v4
 x Environmental effects -- v3
 - Density dependence
-- Fecundity
-- Seeds unobserved
+x Fecundity
+x Seeds unobserved
 - Hierarchical random effects for sites/years/etc
 
 

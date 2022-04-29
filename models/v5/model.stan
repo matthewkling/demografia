@@ -1,97 +1,97 @@
 functions {
-  vector project_simplex(matrix x, int t, int k, int K) {
-    row_vector[K] y = rep_row_vector(0, K);
+  vector project_simplex(matrix x, int k, int t) {
+    row_vector[rows(x)] y = rep_row_vector(0, rows(x));
     y[k] = 1;
     for(j in 1:t) {
       y = y * x;
     }
     return to_vector(y);
   }
+  
+  array[] int index_ones(array[] int x) {// return a vector of the indices where boolean verctor x == 1
+    array[sum(x)] int index;
+    int j = 1;
+    for (i in 1:size(x)) {
+      if (x[i] == 1) {
+        index[j] = i;
+        j = j + 1;
+      }
+    }
+    return(index);
+  }
 }
 
 data {
   int K; // number of stages
-  int N; // number of sites
-  int D; // number of predictor variables
-  int yk0; // index of first stage for y data
-  int yK0; // number of t0 stages for y data
-  int yK1; // number of tt stages for y data
-  array[yK0, yK1, N] int y; // observed individual-level outcomes
-  array[2, K, N] real m; // real if Gauss; observed class counts at 2 time points
-  // array[2, K, N] int m; // int if multiniomial; observed class counts at 2 time points
-  int mk0; // indices of first stage for which m is observed
-  int mk1; // indices of last stage for which m is observed
-  matrix[N, D] x; // predictor data
-  int t[N]; // timesteps since prior survey
-  real F; // fecundity of each stage
+  int B; // number of blocks
+  array[B] row_vector[K] n0; // collective frequencies at time 0
+  array[B] vector[K] nt; // collective frequencies at time t
+  int nk; // index of earliest stage at which frequency is observed
+  array[B, 2, K+1] int io; // individual outcomes
+  array[2] int iok; // indices of stages included in io data
+  int t; // number of timesteps
+  real F; // fecundity 
   int Fk; // index of reproductive stage
-  array[D] matrix[K, K] zero_beta;
-  matrix[K, K] zero_alpha;
+  array[K, K+1] int alpha_i;
+  int n_alpha;
+  vector[n_alpha] alpha_mu; // prior means for alpha
+  vector<lower=0>[n_alpha] alpha_sigma; // prior variance for alpha
 }
 
 parameters {
-  matrix<upper=0>[K, K] alpha;
-  array[D] matrix[K, K] beta;
+  vector[n_alpha] alpha; // on LOG scale
   real<lower=0> sigma;
 }
 
 transformed parameters {
-  matrix[K, K] zeroed_alpha;
-  array[D] matrix[K, K] zeroed_beta;
-  for (k in 1:K) {
-    zeroed_alpha[k] = alpha[k] - 20 * (1.0 - zero_alpha[k]); // this gets alpha very small... my attempts to make it -Inf caused sampling to fail
+  matrix[K, K+1] A; // projection matrix
+  
+  {
+    int start = 0;
+    for (k in 1:K) {
+      A[k,] = rep_row_vector(0, K+1);
+      int na = sum(alpha_i[k]); // number of alphas for this life stage
+      array[na] int ai;
+      for (i in 1:na) ai[i] = i + start;
+      A[k, index_ones(alpha_i[k])] = to_row_vector(softmax(alpha[ai]));
+      start = start + na;
+    }
   }
-  for (d in 1:D) {
-    zeroed_beta[d] = beta[d] .* zero_beta[d]; // zero-out irrelevant betas
-  }
+  
+  A[Fk, 1] = F;
 }
+
 
 model {
   
   // priors
-  for (k in 1:K) {
-    logit(exp(alpha[k])) ~ normal(0, 5);
-  }
-  for (d in 1:D) {
-    to_vector(beta[d]) ~ normal(0, 1);
-  }
+  alpha ~ normal(alpha_mu, alpha_sigma);
   
-  // likelihood
-  for (n in 1:N) {
+  for(b in 1:B) {
     
-    // apply predictor effects
-    matrix[K, K] A = zeroed_alpha;
-    for (d in 1:D) {
-      A = A + x[n, d] * zeroed_beta[d];
-    }
+    // local projection matrix
     
-    // normalize to simplexes (note: can't be combined w loop below)
-    for (k in 1:K) {
-      A[k] = to_row_vector(softmax(to_vector(A[k])));
-    }
-    
-    // individual-based transitions
-    matrix[yK1, yK1] Ay = A[yk0:K, yk0:K];
-    for (k in 1:yK0) {
-      y[k, , n] ~ multinomial(softmax(log(project_simplex(Ay, t[n], k, K - yK1 + 1))));
-    }
     
     // collective distribution changes
-    row_vector[K] P = to_row_vector(m[1, , n]);
-    matrix[K, K] AF = A;
-    AF[Fk, 1] = F;
-    for(T in 1:t[n]) {
-        P = P * AF;
+    row_vector[K] P = n0[b];
+    for(T in 1:t) {
+      P = P * A[, 1:K];
+    }
+    log(nt[b, nk:K]) ~ normal(log(P[nk:K]), sigma);
+    
+    // individual outcomes
+    matrix[K+1, K+1] S = append_row(A, rep_row_vector(0, K+1));
+    S[K+1, K+1] = 1;
+    S[Fk, 1] = 0;
+    for(k in 1:size(iok)) {
+      vector[K+1] p = project_simplex(S, iok[k], t);
+      p = p + 1e-12;
+      p = p / sum(p);
+      io[b, k] ~ multinomial(p);
     }
     
-    
-    // multinomial approach -- i.e. change in stage distribution
-    // P = P[mk0:mk1];
-    // m[2, mk0:mk1, n] ~ multinomial(to_vector(P / sum(P)));
-    
-    // another approach -- Gaussian error on log counts
-    log(m[2, mk0:mk1, n]) ~ normal(log(P[mk0:mk1]), sigma);
-    
   }
+  
+  
   
 }

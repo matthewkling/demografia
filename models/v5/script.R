@@ -1,431 +1,325 @@
 
 # this version incorporates fecundity and unknown seedling turnover
+# but drops environmental effects for the time being
 
-
-
+## setup #################
 library(tidyverse)
 library(cmdstanr)
 library(patchwork)
 
-
-## utils #########
+## utils ####################
 
 logit <- function(x) log(x / (1-x))
+
 softmax <- function(x) exp(x) / sum(exp(x))
 # softmax(log(c(.1, .2, .3, .4))) # demo that log is the inverse of softmax
 
+sim <- function(x, p, fecundity, iter = 50){
+      # x <- matrix(c(0, 0, 0, 10, 0), 1)
+      # p[1,4] <- fecundity
+      x <- as.vector(x)
+      k <- length(x)
+      n <- matrix(NA, 1 + iter, ncol(p),
+                  dimnames = list(NULL, colnames(p)))
+      n[1,] <- x
+      for(i in 1:iter){
+            # x <- x %*% t(p)
+            xi <- sapply(1:k, function(j){
+                  rmultinom(1, x[j], p[,j])
+            }) %>%
+                  apply(1, sum)
+            xi[1] <- x[4] * fecundity
+            n[i+1,] <- xi[1:k]
+            x <- xi[1:k]
+      }
+      
+      n %>% as.data.frame() %>% as_tibble() %>%
+            mutate(t = 0:iter)
+}
 
-## simulate dataset ########
-
-stages <- c("p", "s", "j", "a", "x") # propagule-seedling-juvenile-adult-dead
-k <- length(stages)
-
-# true projection matrix -- origin in COLS, outcome in ROWS
-p <- matrix(0, k, k, dimnames = list(stages, stages))
-p["s", "p"] <- .05
-p["s", "s"] <- .3
-p["j", "s"] <- .01
-p["j", "j"] <- .95
-p["a", "j"] <- .01
-p["a", "a"] <- .995
-p["x",] <- apply(p, 2, function(x) 1 - sum(x))
-p <- apply(p, 2, function(x) softmax(log(x)))
-
-fecundity <- 400
-
-# function that converts an annual simplex to a multiyear simplex
 project_simplex <- function(p, # projection matrix 
                             t, # number of time steps
                             i){ # life stage to project
-  n <- matrix(0, 1, ncol(p))
-  n[i] <- 1
-  for(j in 1:t) n <- n %*% t(p)
-  return(as.vector(n))
+      n <- matrix(0, 1, nrow(p))
+      n[i] <- 1
+      for(j in 1:t) n <- n %*% t(p)
+      return(as.vector(n))
 }
 
-# simulation specs
-n_i <- 1000 # number of individuals per block
-n_blocks <- 100 # number of blocks (where a block is e.g. one resurvey for a site)
 
-# environmental predictors
-x <- matrix(runif(n_blocks*2), n_blocks, 2)
-colnames(x) <- c("v1", "v2")
 
-# specify predictor effects
-betas <- array(0, 
-               dim = c(ncol(p), ncol(x), nrow(p)),
-               dimnames = list(colnames(p), colnames(x), rownames(p)))
-# betas["s", "v1", "s"] <- 3
-# betas["s", "v2", "s"] <- -2
-betas["a", "v1", "x"] <- -1
-betas["a", "v2", "a"] <- -1
-betas["j", "v1", "j"] <- -.5
-betas["j", "v2", "a"] <- 2
 
-# binary indicator of which betas to infer (passed to model)
-zero_beta <- betas
-zero_beta[] <- as.integer(betas[] != 0)
 
-# individual-level outcome counts
-y <- array(dim = c(k, k, n_blocks),
-           dimnames = list(colnames(p),
-                           rownames(p),
-                           paste0("b", 1:n_blocks)))
+## projection matrix priors #############
 
-# population frequency counts
-m <- array(dim = c(2, k, n_blocks),
-           dimnames = list(c("t0", "tt"),
-                           stages,
-                           dimnames(y)[[3]]))
+# see alpha_priors.r for testing and vis
 
-# timesteps between years
-t <- sample(5:10, n_blocks, replace = T)
-# t <- rep(1, n_blocks)
+make_priors <- function(stages){
+      
+      stages <- c("p", "s", "j", "a") # propagule-seedling-juvenile-adult-dead
+      labels <- c("propagules", "seedlings", "saplings", "adults")
+      names(labels) <- stages
+      k <- length(stages)
+      
+      # prior expectations for projection matrix -- origin in COLS, outcome in ROWS
+      pp <- matrix(0, k+1, k, dimnames = list(c(stages, "x"), stages))
+      pp["s", "p"] <- .002
+      pp["s", "s"] <- .3
+      pp["j", "s"] <- .02
+      pp["j", "j"] <- .95
+      pp["a", "j"] <- .01
+      pp["a", "a"] <- .995
+      pp["x",] <- apply(pp, 2, function(x) 1 - sum(x))
+      pp <- apply(pp, 2, function(x) softmax(log(x)))
+      
+      alpha_i <- ceiling(t(pp)) # boolean indicating nonzero transitions
+      
+      mu <- log(pp)
+      sigma <- mu
+      sigma[] <- rep(c(2, 1, 2, 2), each = nrow(pp))
+      
+      alpha_mu <- mu[is.finite(mu)]
+      alpha_sigma <- sigma[is.finite(mu)]
+      
+      list(p = pp,
+           mu = mu,
+           sigma = sigma,
+           alpha_i = alpha_i,
+           alpha_mu = alpha_mu,
+           alpha_sigma = alpha_sigma,
+           stages = labels)
+}
 
-# simulate
-for(s in 1:n_blocks){
-  
-  xs <- x[s,] # local environment
-  ps <- p # to, from
-  
-  # apply covariate effects
-  for(i in 1:k){ # from
-    for(j in 1:k){ # to
-      for(v in 1:ncol(x)){ # var
-        b <- betas[i,v,j]
-        if(b == 0) next()
-        # if(b == -1) stop()
-        lp <- log(ps[,i]) # convert to logit scale
-        lp[j] = lp[j] + betas[i, v, j] * xs[[v]] # apply effect
-        ps[,i] <- softmax(lp) # convert back to probability
+prior <- make_priors(stages)
+
+
+
+
+## true matrix, sampled from prior ###########
+
+make_species <- function(prior){
+      p <- prior$p
+      for(i in 1:ncol(p)){
+            nz <- which(p[,i] > 0)
+            p[nz, i] <- softmax(rnorm(length(nz), prior$mu[nz, i], prior$sigma[nz, i]))
       }
-    }
-  }
-  
-  probs <- sapply(1:k, function(i) project_simplex(ps, t[s], i))
-  rownames(probs) <- colnames(probs) <- colnames(ps)
-  
-  d <- tibble(s0 = sample(stages, n_i, replace = T),
-              s1 = apply(probs[, s0], 2, function(x) sample(stages, 1, prob = x))) %>%
-    count(s0, s1) %>%
-    full_join(expand_grid(s0 = colnames(p),
-                          s1 = rownames(p))) %>%
-    mutate(n = ifelse(is.na(n), 0, n)) %>%
-    spread(s0, n) %>%
-    column_to_rownames("s1") %>%
-    as.matrix()
-  d <- d[rownames(p), colnames(p)]
-  y[ , , s] <- t(d)
-  
-  # full matrix projection
-  A <- probs
-  A["p", "a"] <- fecundity
-  mi <- matrix(apply(d, 2, sum), 1,
-               dimnames = list(NA, stages))
-  mi[, "p"] <- mi[, "a"] * fecundity
-  m["t0", , s] <- mi
-  for(i in 1:t[s]) mi <- mi %*% t(A)
-  m["tt", , s] <- mi
-  
+      
+      fecundity <- 500
+      
+      list(p = p,
+           fecundity = fecundity)
 }
 
-# # check that covarites had the desired effect
-# plot(x[,1], y["a","x",])
-# plot(x[,2], y["j","a",])
-
-
-# specify which transitions to infer
-zero_alpha <- ceiling(p) %>% t()
-
-# for FIA, have to set ONE of these two params to zero (or another arbitrary value)
-# because we don't have the individual-level data to infer both
-zero_alpha["s", "x"] <- 0
-zero_alpha["s", "s"] <- 0
+sp <- make_species(prior)
 
 
 
+## simulate dataset ############################
 
-## process to mimic FIA ########
-
-## stage distribution changes ##
-
-# cull to match FIA, with no propagule or dead counts
-m[, c("p", "x"), ] <- 0
-
-# add propagules, based on adults
-# assumes adults at t = -1 == adults at t = 0, which we'll need to do for FIA
-m[1, "p", ] <- m[1, "a", ] * fecundity
-
-# specify which stages to evaluate in model likelihood calculation
-m_eval <- 2:4
-
-# convert to integers
-# m <- round(m)
-
-
-## individual-level transitions ##
-y0_eval <- match(c("j", "a"), stages)
-y1_eval <- match(c("j", "a", "x"), stages)
-y <- y[y0_eval, y1_eval, ]
-
-
-
-
-## fit stan model ############
-
-dat <- list(
-  K = k,
-  N = n_blocks,
-  D = ncol(x),
-  yk0 = min(y0_eval),
-  yK0 = length(y0_eval),
-  yK1 = length(y1_eval),
-  y = y, # from, to, block
-  m = m,
-  mk0 = min(m_eval),
-  mk1 = max(m_eval),
-  x = x, # block, var
-  t = t,
-  "F" = fecundity,
-  Fk = match("a", stages),
-  zero_alpha = zero_alpha, # from, to
-  zero_beta = aperm(zero_beta, c(2, 1, 3)) # var, from, to
-)
-
-# compile
-model <- cmdstan_model("models/v5/model.stan")
-
-# fit <- model$optimize(
-#   data = dat,
-#   init = function() list(alpha = t(log(apply(log(p+1e-5), 2, softmax))))
-# )
-
-# fit <- model$variational(
-#   data = dat
-# )
-
-# # run MCMC
-fit <- model$sample(
-  data = dat,
-  # init = function() list(alpha = t(apply(log(p)+1e-10, 2, softmax))),
-  chains = 1,
-  iter_warmup = 200, iter_sampling = 100, refresh = 30
-)
-
-
-
-# fit$profiles()
-
-
-
-## assess fit #########
-
-# fs <- fit$summary() %>% mutate(mean = estimate)
-
-## alphas ##
-
-# f <- fit$draws()[,1,] %>%
-#   as.data.frame() %>% as_tibble() %>%
-#   mutate(i = 1:nrow(.)) %>%
-#   gather(variable, value, -i) %>%
-#   filter(str_detect(variable, "zeroed_alpha")) %>%
-#   mutate(variable = str_remove_all(variable, "zeroed_alpha|\\[|\\]|1\\.")) %>%
-#   separate(variable, c("s0", "s1"), sep = ",") %>%
-#   mutate(s0 = colnames(p)[as.integer(s0)],
-#          s1 = rownames(p)[as.integer(s1)]) %>%
-#   group_by(i, s0) %>%
-#   mutate(value = softmax(value)) %>%
-#   ungroup() %>%
-#   unite(trans, s0, s1) %>%
-#   spread(trans, value)
-# 
-# fx <- f %>% select(starts_with("p_")) %>%
-#   apply(1, softmax) %>%
-#   t() %>%
-#   as.data.frame() %>% as_tibble()
-# 
-# ggplot(f, aes(p_s, s_x, color = p_x)) +
-#   geom_point() +
-#   geom_smooth(method = lm, se = F, color = "black") +
-#   # scale_y_log10() +
-#   scale_color_viridis_c(trans = "log10")
-
-
-
-pd <- p %>%
-  as.data.frame() %>% 
-  rownames_to_column("s1") %>% as_tibble() %>%
-  gather(s0, true, -s1)
-
-fa <- fit$summary() %>%
-  filter(str_detect(variable, "zeroed_alpha")) %>%
-  mutate(variable = str_remove_all(variable, "zeroed_alpha|\\[|\\]")) %>%
-  separate(variable, c("s0", "s1"), sep = ",") %>%
-  mutate(s0 = colnames(p)[as.integer(s0)],
-         s1 = rownames(p)[as.integer(s1)]) %>%
-  left_join(pd) %>%
-  group_by(s0) %>%
-  mutate(pred = softmax(mean),
-         q5 = softmax(q5),
-         q95 = softmax(q95))
-
-# l <- 8
-# ggplot(f, aes(logit(true), logit(pred), 
-#               ymin = logit(q5), ymax = logit(q95))) + 
-#   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
-#   # geom_linerange(size = .25) +
-#   geom_point(aes(color = s1, shape = "t + 1"), size = 3) +
-#   geom_point(aes(color = s0, shape = "t"), size = 5) +
-#   scale_shape_manual(values = c(10, 16)) +
-#   coord_cartesian(xlim = c(-l, l),
-#                   ylim = c(-l, l)) +
-#   theme_minimal() +
-#   labs(color = "stage",
-#        shape = NULL)
-
-p_alpha <- ggplot(fa %>% filter(true > 0, paste0(s0, s1) != "xx"), 
-                  aes(logit(true), logit(pred), 
-                      ymin = logit(q5), ymax = logit(q95))) + 
-  geom_abline(slope = 1, intercept = 0, alpha = .3) +
-  geom_linerange(size = .25) +
-  geom_point() +
-  ggrepel::geom_text_repel(aes(label = paste0(s0, s1)), direction = "x") +
-  theme_minimal() +
-  labs(title = expression(alpha))
-
-
-
-## betas ##
-
-bd <- betas %>%
-  as.data.frame() %>% 
-  rownames_to_column("s0") %>% as_tibble() %>%
-  gather(par, true, -s0) %>%
-  separate(par, c("v", "s1"), sep = "\\.")
-
-f <- fit$summary() %>%
-  filter(str_detect(variable, "zeroed_beta")) %>%
-  mutate(variable = str_remove_all(variable, "zeroed_beta|\\[|\\]")) %>%
-  separate(variable, c("v", "s0", "s1"), sep = ",") %>%
-  mutate(s0 = colnames(p)[as.integer(s0)],
-         s1 = rownames(p)[as.integer(s1)],
-         v = colnames(x)[as.integer(v)]) %>%
-  left_join(bd)
-
-p_beta <- f %>%
-  ggplot(aes(true, mean,
-             ymin = q5, ymax = q95
-             )) +
-  geom_abline(slope = 1, intercept = 0, alpha = .3) +
-  geom_linerange(size = .25) +
-  geom_point() +
-  ggrepel::geom_text_repel(aes(label = paste0(v, "-", s0, s1)), direction = "x") +
-  theme_minimal() +
-  labs(title = expression(beta),
-       y = "pred")
-
-
-p <- p_alpha + p_beta +
-  plot_layout(nrow = 1) &
-  theme(plot.title = element_text(hjust = .5, size= 20))
-ggsave("models/v5/alpha_beta.png", p, width = 6, height = 3.5, units = "in")
-
-
-
-
-## simulate true vs predicted population trajectories #############
-
-f <- fit$draws()[,1,] %>%
-  as.data.frame() %>% as_tibble() %>%
-  mutate(i = 1:nrow(.)) %>%
-  gather(variable, value, -i) %>%
-  filter(str_detect(variable, "zeroed_alpha")) %>%
-  mutate(variable = str_remove_all(variable, "zeroed_alpha|\\[|\\]|1\\.")) %>%
-  separate(variable, c("s0", "s1"), sep = ",") %>%
-  mutate(s0 = colnames(p)[as.integer(s0)],
-         s1 = rownames(p)[as.integer(s1)]) %>%
-  group_by(i, s0) %>%
-  mutate(value = softmax(value)) %>%
-  ungroup()
-
-sim <- function(x, p, fecundity, iter = 50){
-  # x <- matrix(c(0, 0, 0, 10, 0), 1)
-  # p[1,4] <- fecundity
-  x <- as.vector(x)
-  n <- matrix(NA, 1 + iter, ncol(p),
-              dimnames = list(NULL, colnames(p)))
-  n[1,] <- x
-  for(i in 1:iter){
-    # x <- x %*% t(p)
-    xi <- sapply(1:length(x), function(i){
-      rmultinom(1, x[i], p[,i])
-    }) %>%
-      apply(1, sum)
-    xi[1] <- x[4] * fecundity
-    # apply(p, 2, function(z) rmultinom(as.vector(x), 1, z))
-    n[i+1,] <- xi
-    x <- xi
-  }
-  
-  n %>% as.data.frame() %>% as_tibble() %>%
-    mutate(t = 0:iter)
+simulate_data <- function(sp, t = 5){
+      
+      # collective counts
+      n0 <- c(300, 10, 10, 3) * 10000
+      nts <- sim(n0, sp$p, sp$fecundity, t)
+      nt <- nts[t+1,] %>% select(-t) %>% as.matrix() %>% as.vector()
+      
+      # individual outcomes
+      io_stages <- 3:4
+      p_sym <- cbind(sp$p, x = c(0, 0, 0, 0, 1))
+      io <- io_stages %>%
+            sapply(function(i) rmultinom(1, n0[i], project_simplex(p_sym, t, i))) %>%
+            t()
+      
+      list(n0 = n0,
+           nt = nt,
+           io = io,
+           io_stages = io_stages,
+           t = t)
 }
 
+d <- simulate_data(sp)
 
-nt <- 25
-# n0 <- matrix(c(10*fecundity, 300, 30, 10, 0), 1)
-n0 <- matrix(c(10*fecundity, 1000, 1000, 1000, 0), 1)
-s <- map_df(unique(f$i), function(i) sim(n0, p, fecundity, nt) %>%
-              mutate(i = i)) %>%
-  mutate(model = "true")
-# s <- sim(n0, p, fecundity, nt) %>%
-#   mutate(i = 0)
 
-x <- f %>%
-  split(.$i) %>%
-  map_df(function(z){
-    y <- z %>%
-      select(-i) %>%
-      spread(s0, value) %>%
-      column_to_rownames("s1")
-    y <- y[match(rownames(p), rownames(y)), 
-           match(colnames(p), colnames(y))]
-    sim(n0, y, fecundity, nt) %>%
-      mutate(i = pull(z, i)[1])
-  }) %>%
-  mutate(model = "pred") %>%
-  bind_rows(s) %>%
-  gather(stage, n, -t, -i, -model) %>%
-  mutate(stage = factor(stage, levels = colnames(p)))
 
-# x %>%
-#   filter(stage != "x") %>%
-#   spread(model, n) %>%
-#   group_by(t, stage) %>%
-#   summarize(p = mean(sign(pred - true))) %>%
-#   ggplot(aes(t, p, color = stage)) +
-#   geom_line() +
-#   ylim(c(-1, 1)) +
-#   theme_minimal() +
-#   labs(y = "mean(sign(pred - true))")
-# 
-# x %>%
-#   filter(stage != "x") %>%
-#   ggplot(aes(t, n, color = model, group = paste(model, i))) +
-#   facet_wrap(~stage, scales = "free") +
-#   geom_line(alpha = .25) +
-#   theme_bw()
+## fit stan model ###################
 
-x %>%
-  filter(stage != "x") %>%
-  group_by(stage, model, t) %>%
-  mutate(mid = median(n),
-         low = quantile(n, .05), 
-         high = quantile(n, .95)) %>%
-  ggplot(aes(t, mid, ymin = low, ymax = high, 
-             color = model, fill = model)) +
-  facet_wrap(~stage, scales = "free", nrow = 1) +
-  geom_ribbon(alpha = .25, color = NA) +
-  geom_line() +
-  theme_bw() +
-  labs(y = "n")
+fit_model <- function(sp, d, algorithm = "sample"){
+      
+      # prepare input data
+      dat <- list(
+            K = ncol(sp$p),
+            n0 = d$n0,
+            nt = d$nt,
+            nk = 2,
+            io = d$io,
+            iok = d$io_stages,
+            t = d$t,
+            "F" = sp$fecundity,
+            Fk = match("a", rownames(sp$p)),
+            alpha_i = prior$alpha_i,
+            n_alpha = length(prior$alpha_mu),
+            alpha_mu = prior$alpha_mu,
+            alpha_sigma = prior$alpha_sigma
+      )
+      
+      model <- cmdstan_model("models/v5/model.stan")
+      
+      if(algorithm == "sample"){
+            fit <- model$sample(
+                  data = dat,
+                  chains = 1
+                  # adapt_delta = .99
+                  # iter_warmup = 200, iter_sampling = 100, refresh = 30
+            )
+      }
+      
+      if(algorithm == "variational"){
+            fit <- model$variational(data = dat)
+      }
+      
+      if(algorithm == "optimize"){
+            fit <- model$optimize(data = dat)
+      }
+      
+      return(fit)
+}
+
+fit <- fit_model(sp, d)
+
+
+
+
+## assess fit ##############################
+
+## true vs fitted parameters ##
+
+alphabet_plot <- function(fit, sp){
+      
+      pd <- sp$p %>% 
+            as.data.frame() %>% 
+            rownames_to_column("s1") %>% as_tibble() %>%
+            gather(s0, true, -s1)
+      
+      fa <- fit$summary() %>%
+            filter(str_detect(variable, "A")) %>%
+            mutate(variable = str_remove_all(variable, "A|\\[|\\]")) %>%
+            separate(variable, c("s0", "s1"), sep = ",") %>%
+            mutate(s0 = colnames(sp$p)[as.integer(s0)],
+                   s1 = rownames(sp$p)[as.integer(s1)]) %>%
+            left_join(pd) %>%
+            group_by(s0) %>%
+            mutate(pred = mean) 
+      
+      ggplot(fa %>% filter(true > 0, paste0(s0, s1) != "xx"), 
+             aes(logit(true), logit(pred), ymin = logit(q5), ymax = logit(q95))) + 
+            geom_abline(slope = 1, intercept = 0, alpha = .3) +
+            ggrepel::geom_text_repel(aes(label = paste0(s0, s1)), 
+                                     direction = "x", segment.size = .25) +
+            geom_linerange(size = .5, color = "darkred") +
+            geom_point(color = "darkred") +
+            theme_minimal() +
+            labs(title = expression(alpha))
+}
+
+alphabet_plot(fit, sp)
+
+
+## simulated projections under true vs fitted params ##
+
+trajectory_plot <- function(fit, sp, prior, t = 100, reps = 100){
+      
+      # starting population for simulation
+      n0sim <- d$n0 / 1000
+      
+      # format posterior values
+      f <- fit$draws() %>% #[,1,] %>%
+            as.data.frame() %>% as_tibble() %>%
+            mutate(i = 1:nrow(.)) %>%
+            gather(variable, value, -i) %>%
+            filter(str_detect(variable, "A")) %>%
+            mutate(variable = str_remove_all(variable, "A|\\[|\\]|1\\.")) %>%
+            separate(variable, c("s0", "s1"), sep = ",") %>%
+            mutate(s0 = colnames(sp$p)[as.integer(s0)],
+                   s1 = rownames(sp$p)[as.integer(s1)]) %>%
+            ungroup() %>%
+            mutate(value = ifelse(s0 == "a" & s1 == "p", 0, value)) %>%
+            filter(i %in% sample(max(i), min(max(i), reps)))
+      
+      # posterior sim
+      post <- f %>%
+            split(.$i) %>%
+            map_df(function(z){
+                  y <- z %>%
+                        select(-i) %>%
+                        spread(s0, value) %>%
+                        column_to_rownames("s1")
+                  y <- y[match(rownames(sp$p), rownames(y)), 
+                         match(colnames(sp$p), colnames(y))]
+                  yy <- try(sim(n0sim, y, sp$fecundity, t) %>%
+                                  mutate(i = pull(z, i)[1]))
+                  if(class(yy) == "try-error") return(NULL)
+                  yy
+            }) %>%
+            mutate(model = "posterior") 
+      
+      # prior sim
+      pryr <- map_df(unique(f$i), 
+                     function(i){
+                           yy <- try(sim(n0sim, make_species(prior)$p, sp$fecundity, t) %>%
+                                           mutate(i = i))
+                           if(class(yy) == "try-error") return(NULL)
+                           yy
+                     }) %>%
+            mutate(model = "prior")
+      
+      # true sim
+      true <- map_df(unique(f$i), 
+                     function(i) sim(n0sim, sp$p, sp$fecundity, t) %>%
+                           mutate(i = i)) %>%
+            mutate(model = "true")
+      
+      
+      
+      # combine and summarize
+      x <- bind_rows(true, post, pryr) %>%
+            gather(stage, n, -t, -i, -model) %>%
+            mutate(stage = factor(stage, levels = names(prior$stages), labels = prior$stages),
+                   model = factor(model, levels = c("prior", "posterior", "true"))) %>%
+            filter(stage != "x") %>%
+            group_by(stage, model, t) %>%
+            mutate(mid = median(n),
+                   low = quantile(n, .025), 
+                   high = quantile(n, .975))
+      
+      # plot
+      p_traj <- x %>%
+            ggplot(aes(t, mid, ymin = low, ymax = high, 
+                       color = model, fill = model)) +
+            facet_wrap(~stage, scales = "free_x", nrow = 1) +
+            geom_ribbon(alpha = .25, color = NA) +
+            geom_line() +
+            scale_y_log10(breaks = c(1, 10, 100, 1000, 10000, 100000),
+                          minor_breaks = c(1:9,
+                                           seq(10, 90, 10),
+                                           seq(100, 900, 100),
+                                           seq(1000, 9000, 1000),
+                                           seq(10000, 90000, 10000),
+                                           seq(100000, 1000000, 100000))) +
+            scale_x_continuous(expand = c(0, 0)) +
+            coord_cartesian(ylim = c(NA, max(x$high[x$model != "prior"]))) +
+            scale_color_manual(values = c("gray40", "darkred", "dodgerblue")) +
+            scale_fill_manual(values = c("gray40", "darkred", "dodgerblue")) +
+            theme_bw() +
+            theme(strip.background = element_rect(fill = "black"),
+                  strip.text = element_text(color = "white", size = 16)) +
+            labs(y = paste0("N(t): 95% CI across ", reps, " simulations"),
+                 x = "t",
+                 color = NULL, fill = NULL)
+      p_traj
+}
+
+trajectory_plot(fit, sp, prior, reps = 100)
+
+
+
+
