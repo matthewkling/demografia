@@ -13,6 +13,7 @@ x Environmental effects -- v3
 x Fecundity
 x Seeds unobserved
 - Hierarchical random effects for sites/years/etc
+- Differences in nested areas over which population sizes are recorded
 
 
 
@@ -55,3 +56,8 @@ which we can get from N adults at t0, and from adult survival (aa).
 N_a_t0 = N_a_tn1 * aa
 N_a_tn1 = N_a_t0 / aa
 N_p_t0 = N_a_t0 / aa * F
+
+
+
+
+Reparameterized beta function as elliptic parabaloid, in order to prevent other classes of quadric surfaces from emerging
